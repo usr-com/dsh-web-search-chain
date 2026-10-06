@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-search-chain",
   "version": "0.1.0",
-  "description": "通用版 Web 搜索 provider 插件：把带 API 与免密钥后端统一到一条可扩展的提供者链上（内置 Tavily / LangSearch / Bing 免密钥抓取 / DeepSeek 官方后端），注册为 @deepseek-ai/dsh-web 的 WebSearchProvider",
+  "description": "Pluggable web-search provider chain for DeepSeek Harness: free-tier API backends and keyless scraping behind one provider, with per-engine request budgets and automatic failover.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -28,15 +28,30 @@
   },
   "keywords": [
     "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
     "cordis",
     "plugin",
     "web-search",
+    "search-provider",
     "tavily",
     "langsearch",
     "bing",
-    "provider"
+    "searxng",
+    "failover"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usr-com/dsh-web-search-chain.git"
+  },
+  "homepage": "https://github.com/usr-com/dsh-web-search-chain#readme",
+  "bugs": {
+    "url": "https://github.com/usr-com/dsh-web-search-chain/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-launch-environment": "*",
