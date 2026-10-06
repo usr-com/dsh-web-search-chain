@@ -35,7 +35,7 @@ export {
   ENGINE_METAS,
   buildEngineChain,
   buildEngines,
-  credentialResolverFor,
+  credentialSourceFor,
   credentialSourcePresentFor,
   customEngineMetas,
   defaultDailyLimits,
@@ -43,6 +43,8 @@ export {
   resolveApiKey,
   sortEngines,
 } from './engines.js'
+export { CredentialKeyState, DEFAULT_NEGATIVE_TTL_MS } from './credential.js'
+export type { CredentialSource } from './credential.js'
 export type {
   BuildChainInput,
   BuildChainResult,

@@ -14,29 +14,26 @@ import type {
 import type { Engine } from './engine.js'
 import type { LlmEngineMeta } from './engines.js'
 import { isAbortError, parseRetryAfterHeader, PLUGIN_USER_AGENT, RATE_LIMIT_STATUS, rateLimitedError, shortErrorMessage } from './util.js'
+import { CredentialKeyState } from './credential.js'
+import type { CredentialSource } from './credential.js'
 
 /** 构造 DeepSeek 适配器所需的解析结果。 */
 export interface DeepSeekEngineOptions {
   /** 引擎的元数据行（端点、模型、token 上限等来自这里）。 */
   readonly meta: LlmEngineMeta
-  /** 已解析的 DeepSeek API 密钥（来自配置或启动环境，同步可知）。 */
+  /** 已从配置/环境解析出的字面量密钥（同步可知）。 */
   readonly apiKey?: string
   /** 端点基础覆盖；`/messages` 会被追加。 */
   readonly baseURL?: string
   /**
-   * 延迟密钥解析器：从 harness 凭据服务读取 `$DSH_HOME/.credentials.yaml`
-   * （即 Web UI Models 页写入的位置）。内置换行搜索的 `web-search-deepseek`
-   * 正是这样取 key 的 —— 没有它，本引擎在桌面端会误判为不可用。
-   */
-  readonly credentialResolver?: () => Promise<string | undefined>
-  /**
-   * 同步判断凭据来源此刻是否存在（即 `ctx.get('credentials')` 是否已挂载）。
+   * harness 凭据 seam：字面量为空时从这里解析。
    *
-   * 必需：凭据服务可能晚于本插件挂载，所以不能在构造时一次性判定
-   * 「有没有 key」；但也不能因为挂了 resolver 就无条件宣称可用 ——
-   * 在完全没有凭据服务的组合里，那会把一个必然失败的引擎放进链。
+   * 内置换行搜索的 `web-search-deepseek` 正是这样取 key 的 —— 桌面端把
+   * DeepSeek key 写在 `$DSH_HOME/.credentials.yaml`，启动环境里看不到它。
+   * 同一个 seam 也覆盖 `.env`，并按「进程环境 > 凭据库 > 项目 .env > home .env」
+   * 的信任顺序取第一个命中的值。
    */
-  readonly credentialSourcePresent?: () => boolean
+  readonly credential?: CredentialSource
 }
 
 /** 一个 `web_search_result` 条目（可引用的结果形状）。 */
@@ -153,49 +150,39 @@ export class DeepSeekEngine implements Engine {
   readonly name: string
   private readonly baseURL: string
   private readonly apiKey?: string
-  private readonly credentialResolver?: () => Promise<string | undefined>
+  private readonly keys: CredentialKeyState
 
   constructor(private readonly options: DeepSeekEngineOptions) {
     this.id = options.meta.id
     this.name = options.meta.name
     this.baseURL = options.baseURL ?? options.meta.endpoint
     this.apiKey = options.apiKey
-    this.credentialResolver = options.credentialResolver
+    this.keys = new CredentialKeyState(options.credential)
   }
 
   /**
    * 本地可用性检查。
    *
-   * 密钥有两个来源：配置/启动环境里的字面量（同步可知），以及 harness 的
-   * 凭据服务（Web UI 的 Models 页把 key 写在 `$DSH_HOME/.credentials.yaml`，
-   * 只能异步解析）。凭据服务**已挂载**时这里乐观返回 true：真正的判定留给
-   * `search()`，因为把一个已配好的内置搜索判成不可用，会让链在最需要兜底的
-   * 时候少掉最后一环；反之，凭据服务根本不存在时如实返回 false，不把一个
-   * 必然失败的引擎塞进链。
+   * 字面量密钥同步可知；凭据库只能异步读，但这里**不乐观放行** ——
+   * 一旦凭据服务已挂载，`confirmed()` 会在毫秒级探到真实结论并缓存；
+   * 在结论出来之前如实返回 false，避免把一个取不到 key 的引擎塞进链里
+   * 白白发一次请求。负结论带 TTL，所以在凭据库里后补 key 无需重启。
    */
   available(): boolean {
-    const hasKey = (this.apiKey?.length ?? 0) > 0
-      || (this.credentialResolver !== undefined && (this.options.credentialSourcePresent?.() ?? false))
+    const hasKey = (this.apiKey?.length ?? 0) > 0 || this.keys.confirmed()
     return hasKey
       && URL.canParse(this.baseURL)
       && Number.isInteger(this.options.meta.maxTokens) && this.options.meta.maxTokens > 0
       && Number.isInteger(this.options.meta.maxUses) && this.options.meta.maxUses > 0
   }
 
-  /** 解析本次请求要用的密钥：字面量优先，其次凭据服务。 */
-  private async resolveKey(): Promise<string | undefined> {
-    if ((this.apiKey?.length ?? 0) > 0) return this.apiKey
-    if (this.credentialResolver === undefined) return undefined
-    const resolved = await this.credentialResolver()
-    return resolved !== undefined && resolved.length > 0 ? resolved : undefined
-  }
-
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const apiKey = await this.resolveKey()
+    const apiKey = await this.keys.resolve(this.apiKey)
     if (apiKey === undefined) {
       throw new WebError(
         `DeepSeek 官方搜索需要 ${this.options.meta.authEnv}：它既不在插件配置/启动环境里，`
-        + '也不在 harness 凭据库中。可在 Web UI 的 Models 页填入 DeepSeek key，或给本引擎配置 apiKey。',
+        + `也不在 harness 凭据库（$DSH_HOME/.credentials.yaml）中。`
+        + '可在 Web UI 的 Models 页填入 DeepSeek key，或给本引擎配置 apiKey。',
         'WEB_PROVIDER_UNAVAILABLE',
       )
     }

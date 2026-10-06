@@ -20,6 +20,7 @@ import { BingEngine } from './bing.js'
 import { DeepSeekEngine } from './llm.js'
 import { JsonApiEngine } from './json-api.js'
 import { DEFAULT_DAILY_LIMIT } from './quota.js'
+import type { CredentialSource } from './credential.js'
 
 /**
  * 自定义引擎的默认优先级。
@@ -275,22 +276,20 @@ interface ResolvedEngineInput {
   readonly meta: EngineMeta
   readonly apiKey?: string
   readonly baseURL?: string
-  /** 仅 llm 引擎使用：延迟到每次搜索时从凭据服务解析密钥。 */
-  readonly credentialResolver?: () => Promise<string | undefined>
-  /** 仅 llm 引擎使用：同步判断凭据服务此刻是否已挂载。 */
-  readonly credentialSourcePresent?: () => boolean
+  /** 需要密钥的引擎共用的凭据来源（字面量为空时生效）。 */
+  readonly credential?: CredentialSource
 }
 
 /** 依据元数据行 + 解析结果分发到对应适配器工厂。 */
 function instantiateEngine(input: ResolvedEngineInput): Engine {
-  const { meta, apiKey, baseURL, credentialResolver, credentialSourcePresent } = input
+  const { meta, apiKey, baseURL, credential } = input
   switch (meta.kind) {
     case 'json-api':
-      return new JsonApiEngine({ meta, apiKey, baseURL })
+      return new JsonApiEngine({ meta, apiKey, baseURL, credential })
     case 'scrape':
       return new BingEngine({ meta, baseURL })
     case 'llm':
-      return new DeepSeekEngine({ meta, apiKey, baseURL, credentialResolver, credentialSourcePresent })
+      return new DeepSeekEngine({ meta, apiKey, baseURL, credential })
   }
 }
 
@@ -316,45 +315,45 @@ export function keyEnvName(meta: EngineMeta, cfg: EngineConfig): string | undefi
 }
 
 /**
- * 构造「从 harness 凭据服务解析密钥」的延迟解析器。
+ * 构造「从 harness 凭据 seam 解析密钥」的来源。
  *
- * 必需，因为桌面端把 key 存在 `$DSH_HOME/.credentials.yaml`（Web UI 的 Models
- * 页写入），而它**不**出现在启动环境里 —— 只用 launchEnvironmentOf 会让
- * DeepSeek 兜底引擎在已经配好内置搜索的机器上误判为不可用。
+ * 这是**所有需要密钥的引擎**共用的取 key 路径，不只 DeepSeek 兜底 —— 因为
+ * 桌面端真正的密钥文件是 `$DSH_HOME/.credentials.yaml`（Models 页写模型密钥
+ * 的地方），它不出现在启动环境里；而 `dsh-credentials-local` 已经把来源按
+ * 信任度排好（进程环境 > 凭据库 > 项目 `.env` > home `.env`），交给它同时
+ * 拿到「和模型密钥同一个文件」与「热重载」。
  *
- * 凭据服务可能晚于本插件挂载，所以每次调用都重新 `ctx.get`；
- * 服务不存在时返回 undefined，由适配器给出可读错误。
+ * 凭据服务可能晚于本插件挂载，所以 `present`/`resolve` 每次调用都重新
+ * `ctx.get`，而不是在装配时固化结论。
  *
  * @param ctx - 插件上下文。
- * @param envName - 凭据引用名（如 `DEEPSEEK_API_KEY`）。
- * @returns 解析器；envName 缺失时返回 undefined（该引擎只认字面量密钥）。
+ * @param envName - 凭据引用名（如 `TAVILY_API_KEY`）。
+ * @returns 凭据来源；envName 缺失时返回 undefined（该引擎只认字面量密钥）。
  */
-export function credentialResolverFor(
-  ctx: Context,
-  envName: string | undefined,
-): (() => Promise<string | undefined>) | undefined {
+export function credentialSourceFor(ctx: Context, envName: string | undefined): CredentialSource | undefined {
   if (envName === undefined || envName.length === 0) return undefined
-  return async () => {
-    const credentials = ctx.get('credentials') as
-      | { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
-      | undefined
-    if (credentials?.resolve === undefined) return undefined
-    try {
-      const hit = await credentials.resolve(envName)
-      const value = hit?.value
-      return value !== undefined && value.length > 0 ? value : undefined
-    } catch {
-      // 凭据服务故障等价于「取不到 key」，由适配器决定如何失败。
-      return undefined
-    }
+  const credentialsOf = (): { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined =>
+    ctx.get('credentials') as { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined
+  return {
+    resolve: async () => {
+      const credentials = credentialsOf()
+      if (credentials?.resolve === undefined) return undefined
+      try {
+        const hit = await credentials.resolve(envName)
+        const value = hit?.value
+        return value !== undefined && value.length > 0 ? value : undefined
+      } catch {
+        // 凭据服务故障等价于「取不到 key」，由适配器决定如何失败。
+        return undefined
+      }
+    },
+    present: () => typeof credentialsOf()?.resolve === 'function',
   }
 }
 
 /**
- * 同步判断 harness 凭据服务此刻是否已挂载。
- *
- * 供 `DeepSeekEngine.available()` 使用：凭据服务可能在本插件之后装载，
- * 所以每次判定都重新 `ctx.get`，而不是在装配时固化结论。
+ * 同步判断 harness 凭据服务此刻是否已挂载（凭据服务可能在本插件之后装载）。
+ * @param ctx - 插件上下文。
  */
 export function credentialSourcePresentFor(ctx: Context): () => boolean {
   return () => {
@@ -596,22 +595,29 @@ export function buildEngineChain(ctx: Context, input: BuildChainInput = {}): Bui
   for (const meta of metas) {
     const cfg = overrides[meta.id] ?? {}
     if (cfg.enabled === false) continue
-    const literalKey = resolvedKey(cfg.apiKey?.trim())
-    // 字面量密钥已经解析到时就不必再挂凭据解析器；挂上也不会被用到
-    // （resolveKey 先返回值），但会白白多一次服务查询。
-    const wantsCredentialService = meta.kind === 'llm' && literalKey === undefined
+    const apiKey = resolveApiKey(ctx, meta, cfg, apiKeys)
+    // 需要密钥的引擎一律接上凭据 seam（不只是 DeepSeek 兜底）：`.credentials.yaml`
+    // 才是桌面端模型密钥所在的文件，而它不在启动环境里。字面量已解析出来时
+    // 也照样接上 —— 解析顺序是「字面量优先，其次凭据库」，多挂一个来源不会
+    // 改变结果，但能让「用户把 key 从配置挪进凭据库」这条路径继续可用。
+    const credential = meta.requiresKey && (apiKey?.length ?? 0) === 0
+      ? credentialSourceFor(ctx, keyEnvName(meta, cfg))
+      : undefined
     engines.push(instantiateEngine({
       meta,
-      apiKey: resolveApiKey(ctx, meta, cfg, apiKeys),
+      apiKey,
       baseURL: resolveBaseURL(ctx, meta, cfg),
-      credentialResolver: wantsCredentialService
-        ? credentialResolverFor(ctx, keyEnvName(meta, cfg))
-        : undefined,
-      credentialSourcePresent: wantsCredentialService ? credentialSourcePresentFor(ctx) : undefined,
+      credential,
     }))
   }
 
-  return { engines: sortEngines(engines, overrides, metas), problems: compiled.problems, metas }
+  const sorted = sortEngines(engines, overrides, metas)
+  // 预热凭据状态。`available()` 必须同步，而凭据库只能异步读，所以引擎在
+  // 结论出来之前会如实报「不可用」。这里先问一遍，让异步探针在第一次搜索
+  // 之前就落定 —— 否则「刚加载完就立刻搜索」的窗口里会漏掉已配好的引擎。
+  for (const engine of sorted) void engine.available()
+
+  return { engines: sorted, problems: compiled.problems, metas }
 }
 
 /**

@@ -39,7 +39,8 @@ silently and turning into a bill.
 - **Aggregate mode.** Optionally query every usable engine concurrently and merge
   results by URL.
 - **No secrets in config files.** Keys resolve from per-engine config, a top-level
-  key section, or environment variables.
+  key section, or the harness credential store (`$DSH_HOME/.credentials.yaml`) —
+  the same seam the model adapters use, watched and reloaded without a restart.
 
 ## Requirements
 
@@ -241,10 +242,11 @@ Rules and gotchas:
 6. **`kind: 'scrape'` reuses Bing's HTML parser**, so it only fits Bing-shaped
    result pages (a mirror or a proxy). For DuckDuckGo, Google, or any other markup,
    put a thin proxy in front that returns JSON and use `kind: 'json-api'`.
-7. **Key resolution** is `engines.<id>.apiKey` → `apiKeys.<id>` → the environment
-   variable named by `apiKeyEnv`. The harness credential store is read by the
-   built-in `deepseek-official` engine only; use config or environment variables
-   for custom engines.
+7. **Key resolution** is `engines.<id>.apiKey` → `apiKeys.<id>` → the harness
+   credential seam, which reads the variable named by `apiKeyEnv` (or the engine's
+   default) from the inherited environment, `$DSH_HOME/.credentials.yaml`, and the
+   `.env` fallbacks — in that order. Custom engines get the same treatment as
+   built-in ones.
 
 ## Configuration reference
 
@@ -286,26 +288,63 @@ interface QuotaConfig {
 Highest precedence first:
 
 1. `engines.<id>.apiKey` — a literal key for one engine.
-2. `apiKeys.<id>` — the top-level key section (rendered as a password field by the
-   DSH settings UI).
-3. The environment variable named by `engines.<id>.apiKeyEnv`, or the engine's
-   default variable (`TAVILY_API_KEY`, `LANGSEARCH_API_KEY`, `DEEPSEEK_API_KEY`).
+2. `apiKeys.<id>` — the top-level key section.
+3. **The harness credential seam** (`ctx.credentials`), resolved per search.
 
-Put keys in a `.env` file rather than in a profile patch. Note that the launch
-environment layers are *process environment → the launching directory's `.env` →
-`$DSH_HOME/.env`*, so the directory you start `dsh` from decides which `.env` is
-read. See [`.env.example`](.env.example) for the template.
+Layer 3 is the same mechanism the model adapters use, so keys live where DSH
+already keeps them. That seam ranks its own sources, and the plugin inherits that
+ranking exactly:
 
-`deepseek-official` additionally reads the harness credential store
-(`$DSH_HOME/.credentials.yaml`), so a key saved through the DSH Models page is
-picked up automatically.
+```text
+inherited process environment        (read-only, wins)
+> $DSH_HOME/.credentials.yaml        (writable — the file the DSH Models page writes)
+> <invoking directory>/.env          (read-only fallback)
+> $DSH_HOME/.env                     (read-only fallback)
+```
+
+**`$DSH_HOME/.credentials.yaml` is the recommended place for an API key.** It is
+the very file the Models page manages, it beats any `.env` (so a key stored there
+is never displaced by one a checkout happens to carry), and it is **watched** —
+edit it and the next search picks the value up, with no restart. It is a strict
+`ref`-to-string mapping:
+
+```yaml
+refs:
+  TAVILY_API_KEY: tvly-xxxxxxxx
+  LANGSEARCH_API_KEY: xxxxxxxx
+```
+
+`.env` still works, but it is read **once at boot** — after editing one, restart
+the harness. Note that the project layer is the *invoking directory's* `.env`,
+which for a desktop app is not necessarily your project directory, so
+`$DSH_HOME/.env` is the more predictable of the two. See
+[`.env.example`](.env.example) for the template.
+
+> ⚠️ Never put a bootstrap variable in a `.env` file. Names starting with `DSH_`
+> (including `DSH_WEB_SEARCH_PROVIDER`), plus `DEEPSEEK_SEARCH_BASE_URL`,
+> `DEEPSEEK_BASE_URL`, the proxy variables, and the `SSL_CERT_*` family, may only
+> come from the launching environment — the harness **refuses to start** if a
+> `.env` declares one.
+
+`DEEPSEEK_API_KEY` needs no setup beyond what chat already uses: if you signed in
+or saved a key through the DSH Models page, the credential store already has it.
+
+### How a missing key behaves
+
+An engine whose key cannot be resolved reports `available() === false` and is
+skipped **without sending a request** — the chain never fires a doomed 401. Keys
+are re-resolved per search, so adding one to `.credentials.yaml` makes its engine
+available on the following search.
+
+Each engine's credential state is also warmed when the chain is built, so the
+asynchronous lookup has settled long before the first search.
 
 ## Development
 
 ```sh
 pnpm build       # tsc -> lib/
 pnpm typecheck   # types only
-pnpm test        # node --test over test/*.test.mjs (94 cases)
+pnpm test        # node --test over test/*.test.mjs (106 cases)
 ```
 
 If `node --test` fails with `spawn EPERM` under a restricted shell, run the files

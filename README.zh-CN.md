@@ -29,7 +29,8 @@ DeepSeek Harness 通过唯一的能力缝 `ctx.web` 访问网络，而这条缝*
   超出预算的请求**根本不会发出去**。
 - **自动降级。** 缺 key 的引擎静默出局（不报错）；网络失败、HTTP 错误、超时都会顺延到下一个引擎。
 - **聚合模式。** 可选并发查询全部可用引擎，并按 URL 去重合并。
-- **配置文件里不放密钥。** 密钥从引擎配置、顶层密钥区或环境变量解析。
+- **配置文件里不放密钥。** 密钥从引擎配置、顶层密钥区，或 harness 凭据库
+  （`$DSH_HOME/.credentials.yaml`，与模型密钥同一套 seam、被热监听、改完不用重启）解析。
 
 ## 环境要求
 
@@ -204,8 +205,10 @@ config:
 5. **`fields.url` 是必填**：seam 的每条 source 都必须有 URL，缺它会被直接判为非法，而不是静默返回空。
 6. **`kind: 'scrape'` 复用 Bing 的 HTML 解析器**，因此只适用于 **Bing 同构的结果页**（镜像或代理）。
    想接 DuckDuckGo、Google 等结构不同的网页，请自己套一层返回 JSON 的代理，再用 `kind: 'json-api'`。
-7. **密钥解析顺序**：`engines.<id>.apiKey` → `apiKeys.<id>` → `apiKeyEnv` 指定的环境变量。
-   harness 凭据库只有内置 `deepseek-official` 引擎会读；自定义引擎请用配置或环境变量。
+7. **密钥解析顺序**：`engines.<id>.apiKey` → `apiKeys.<id>` → harness 凭据 seam。
+   该 seam 会按自己的信任顺序去取 `apiKeyEnv`（或引擎默认变量）指定的名字：
+   继承的进程环境 > `$DSH_HOME/.credentials.yaml` > 项目 `.env` > `$DSH_HOME/.env`。
+   自定义引擎与内置引擎走的是同一条路径。
 
 ## 配置项
 
@@ -246,23 +249,55 @@ interface QuotaConfig {
 优先级从高到低：
 
 1. `engines.<id>.apiKey` —— 单引擎字面密钥。
-2. `apiKeys.<id>` —— 顶层密钥区（DSH 设置界面会以密码框渲染）。
-3. `engines.<id>.apiKeyEnv` 指定的环境变量，或引擎的默认变量
-   （`TAVILY_API_KEY` / `LANGSEARCH_API_KEY` / `DEEPSEEK_API_KEY`）。
+2. `apiKeys.<id>` —— 顶层密钥区。
+3. **harness 凭据 seam**（`ctx.credentials`），每次搜索时解析一次。
 
-请把密钥放进 `.env`，而不是 profile patch。注意启动环境层是「进程环境 → 启动目录的 `.env` →
-`$DSH_HOME/.env`」，**你从哪个目录启动 dsh，就决定读哪个 `.env`**。模板见
-[`.env.example`](.env.example)。
+第 3 层就是模型适配器用的那套机制，所以密钥和模型密钥放在同一个地方。该 seam
+自己排好了来源顺序，插件完全继承：
 
-`deepseek-official` 还会读取 harness 凭据库（`$DSH_HOME/.credentials.yaml`），因此在 DSH 的
-Models 页保存过的 key 会被自动复用。
+```text
+继承的进程环境                    （只读，最高）
+> $DSH_HOME/.credentials.yaml     （可写 —— DSH 的 Models 页写模型密钥就是写这里）
+> <启动目录>/.env                 （只读兜底）
+> $DSH_HOME/.env                  （只读兜底）
+```
+
+**推荐把 API 密钥写进 `$DSH_HOME/.credentials.yaml`。** 它正是 Models 页管理的那个文件；
+它压过任何 `.env`（所以不会被仓库里夹带的旧 key 顶掉）；而且它**被热监听** ——
+改完下一次搜索就生效，**不用重启**。格式是严格的「引用名 → 字符串」映射：
+
+```yaml
+refs:
+  TAVILY_API_KEY: tvly-xxxxxxxx
+  LANGSEARCH_API_KEY: xxxxxxxx
+```
+
+`.env` 依然可用，但它在**启动时只读一次** —— 改完要重启 harness。另外「项目层」指的是
+**启动目录**的 `.env`，而桌面端的启动目录不一定是你的项目目录，所以 `$DSH_HOME/.env`
+比它更可预期。模板见 [`.env.example`](.env.example)。
+
+> ⚠️ **不要把引导变量写进 `.env`。** `DSH_` 开头的名字（包括 `DSH_WEB_SEARCH_PROVIDER`）、
+> `DEEPSEEK_SEARCH_BASE_URL`、`DEEPSEEK_BASE_URL`、代理变量、`SSL_CERT_*` 系列，
+> 都只能来自启动环境 —— `.env` 里出现其中之一，harness 会**直接拒绝启动**。
+
+`DEEPSEEK_API_KEY` 不需要额外配置：只要你在 DSH 的 Models 页登录过或填过 key，
+凭据库里就已经有了。
+
+### 密钥缺失时的行为
+
+取不到密钥的引擎会报告 `available() === false` 并被跳过，**一个请求都不会发出去**
+—— 链不会去打一次注定 401 的请求。密钥每次搜索都重新解析，所以往
+`.credentials.yaml` 里补上 key 之后，下一次搜索该引擎就可用。
+
+另外，装配链时会顺带预热各引擎的凭据状态，因此那次异步查询在第一次搜索之前
+早就落定了。
 
 ## 开发
 
 ```sh
 pnpm build       # tsc 编译到 lib/
 pnpm typecheck   # 仅类型检查
-pnpm test        # node --test 跑 test/*.test.mjs（94 个用例）
+pnpm test        # node --test 跑 test/*.test.mjs（106 个用例）
 ```
 
 若在受限 shell 里 `node --test` 报 `spawn EPERM`，请逐个文件直接运行 —— 入口文件里的

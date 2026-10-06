@@ -17,15 +17,23 @@ import type {
   JsonApiResponseSpec,
 } from './engines.js'
 import { getPath, isAbortError, parseRetryAfterHeader, PLUGIN_USER_AGENT, RATE_LIMIT_STATUS, rateLimitedError, shortErrorMessage } from './util.js'
+import { CredentialKeyState } from './credential.js'
+import type { CredentialSource } from './credential.js'
 
 /** 构造 JSON API 适配器所需的解析结果。 */
 export interface JsonApiEngineOptions {
   /** 引擎的元数据行（端点、请求/响应映射都来自这里）。 */
   readonly meta: JsonApiEngineMeta
-  /** 已解析的 API 密钥（缺省 undefined）。 */
+  /** 已从配置/环境解析出的字面量密钥（缺省 undefined）。 */
   readonly apiKey?: string
   /** 端点覆盖（完整 URL，常用于自建代理）。 */
   readonly baseURL?: string
+  /**
+   * harness 凭据 seam：需要密钥的引擎会先查字面量，再查它。
+   * 走这条缝意味着 `$DSH_HOME/.credentials.yaml`（Models 页写模型密钥的地方）
+   * 与 `.env` 都能供 key，且前者被热监听、改完即生效。
+   */
+  readonly credential?: CredentialSource
 }
 
 /**
@@ -118,23 +126,47 @@ export class JsonApiEngine implements Engine {
   readonly name: string
   private readonly endpoint: string
   private readonly apiKey?: string
+  private readonly keys: CredentialKeyState
 
   constructor(private readonly options: JsonApiEngineOptions) {
     this.id = options.meta.id
     this.name = options.meta.name
     this.endpoint = options.baseURL ?? options.meta.endpoint
     this.apiKey = options.apiKey
+    this.keys = new CredentialKeyState(options.credential)
   }
 
+  /**
+   * 本地可用性检查。
+   *
+   * 需要密钥时：字面量（配置/环境）同步可知，凭据库只能异步读 ——
+   * `CredentialKeyState.confirmed()` 只在**确认**有 key 时返回 true，
+   * 绝不乐观放行，否则没有 key 的引擎会白白发出注定 401 的请求，
+   * 而链的设计恰恰要求这类引擎被瞬间跳过。
+   */
   available(): boolean {
-    if (this.options.meta.requiresKey && (this.apiKey?.length ?? 0) === 0) return false
-    return URL.canParse(this.endpoint)
+    if (!URL.canParse(this.endpoint)) return false
+    if (!this.options.meta.requiresKey) return true
+    if ((this.apiKey?.length ?? 0) > 0) return true
+    return this.keys.confirmed()
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     const meta = this.options.meta
     const { queryField, countField, extra, extraQuery } = meta.request
     const method = meta.method
+
+    // 每次搜索都重新解析密钥，凭据库改动立即可见。
+    const key = await this.keys.resolve(this.apiKey)
+    if (meta.requiresKey && key === undefined) {
+      throw new WebError(
+        `${this.name} 需要密钥${meta.authEnv !== undefined ? `（${meta.authEnv}）` : ''}：`
+        + '它既不在插件配置/启动环境里，也不在 harness 凭据库中。'
+        + '可把它写进 $DSH_HOME/.credentials.yaml，或配置 engines.'
+        + `${meta.id}.apiKey。`,
+        'WEB_PROVIDER_CREDENTIAL_MISSING',
+      )
+    }
 
     // GET 的查询全部走查询串；POST 的查询词在请求体里，但 `extraQuery` 与
     // `auth: 'query'` 两种模式仍要拼到 URL 上（很多接口混用两者）。
@@ -148,10 +180,10 @@ export class JsonApiEngine implements Engine {
         }
       }
       if (extraQuery !== undefined) {
-        for (const [key, value] of Object.entries(extraQuery)) url.searchParams.set(key, value)
+        for (const [name, value] of Object.entries(extraQuery)) url.searchParams.set(name, value)
       }
-      if (meta.auth === 'query' && (this.apiKey?.length ?? 0) > 0) {
-        url.searchParams.set(meta.authParam as string, this.apiKey as string)
+      if (meta.auth === 'query' && (key?.length ?? 0) > 0) {
+        url.searchParams.set(meta.authParam as string, key as string)
       }
       endpoint = url.toString()
     }
@@ -167,7 +199,7 @@ export class JsonApiEngine implements Engine {
       response = await fetch(endpoint, {
         method,
         redirect: 'error',
-        headers: this.buildHeaders(),
+        headers: this.buildHeaders(key),
         ...method === 'POST' ? { body: JSON.stringify(body) } : {},
         ...signal !== undefined ? { signal } : {},
       })
@@ -217,14 +249,14 @@ export class JsonApiEngine implements Engine {
     return { sources, truncated: false }
   }
 
-  private buildHeaders(): Record<string, string> {
+  /** 组装鉴权请求头；`auth: 'query'` 与 `'none'` 不加头，密钥已由调用方解析。 */
+  private buildHeaders(key: string | undefined): Record<string, string> {
     const headers: Record<string, string> = {
       'accept': 'application/json',
       'user-agent': PLUGIN_USER_AGENT,
     }
     if (this.options.meta.method === 'POST') headers['content-type'] = 'application/json'
     const auth = this.options.meta.auth
-    const key = this.apiKey
     if (auth !== 'none' && auth !== 'query' && (key?.length ?? 0) > 0) {
       if (auth === 'x-api-key') {
         headers['x-api-key'] = key as string

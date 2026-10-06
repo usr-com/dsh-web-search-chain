@@ -13,8 +13,9 @@ import { QuotaGuard, utcDay } from '../lib/quota.js'
 import { ChainSearchProvider } from '../lib/provider.js'
 import { parseRetryAfterHeader, rateLimitedError, isRateLimited } from '../lib/util.js'
 import { pickErrorDetail } from '../lib/json-api.js'
-import { ENGINE_METAS, defaultDailyLimits, credentialResolverFor, keyEnvName } from '../lib/engines.js'
+import { ENGINE_METAS, defaultDailyLimits, credentialSourceFor, keyEnvName } from '../lib/engines.js'
 import { DeepSeekEngine } from '../lib/llm.js'
+import { CredentialKeyState } from '../lib/credential.js'
 
 /** 可控时钟。 */
 function clock(start = Date.parse('2026-10-06T10:00:00Z')) {
@@ -308,48 +309,120 @@ test('keyEnvName：显式 apiKeyEnv 覆盖元数据默认名，免密钥引擎�
   assert.equal(keyEnvName(bingMeta, {}), undefined)
 })
 
-test('credentialResolverFor：envName 缺失时不构造解析器', () => {
-  assert.equal(credentialResolverFor({ get: () => undefined }, undefined), undefined)
-  assert.equal(credentialResolverFor({ get: () => undefined }, ''), undefined)
+test('credentialSourceFor：envName 缺失时不构造凭据来源', () => {
+  assert.equal(credentialSourceFor({ get: () => undefined }, undefined), undefined)
+  assert.equal(credentialSourceFor({ get: () => undefined }, ''), undefined)
 })
 
-test('credentialResolverFor：从 harness 凭据服务读 key（Web UI 写入的位置）', async () => {
+test('credentialSourceFor：从 harness 凭据服务读 key（$DSH_HOME/.credentials.yaml）', async () => {
   const ctx = {
     get: (name) => (name === 'credentials'
       ? { resolve: async (ref) => (ref === 'DEEPSEEK_API_KEY' ? { value: 'from-store' } : undefined) }
       : undefined),
   }
-  const resolve = credentialResolverFor(ctx, 'DEEPSEEK_API_KEY')
-  assert.equal(await resolve(), 'from-store')
+  const source = credentialSourceFor(ctx, 'DEEPSEEK_API_KEY')
+  assert.equal(await source.resolve(), 'from-store')
+  assert.equal(source.present(), true)
 
   // 空串与缺失都读作「没有」，避免把空白当成已配置的密钥。
   const blankCtx = { get: () => ({ resolve: async () => ({ value: '' }) }) }
-  assert.equal(await credentialResolverFor(blankCtx, 'DEEPSEEK_API_KEY')(), undefined)
+  assert.equal(await credentialSourceFor(blankCtx, 'DEEPSEEK_API_KEY').resolve(), undefined)
   const missingCtx = { get: () => undefined }
-  assert.equal(await credentialResolverFor(missingCtx, 'DEEPSEEK_API_KEY')(), undefined)
+  assert.equal(await credentialSourceFor(missingCtx, 'DEEPSEEK_API_KEY').resolve(), undefined)
+  assert.equal(credentialSourceFor(missingCtx, 'DEEPSEEK_API_KEY').present(), false)
 })
 
-test('credentialResolverFor：凭据服务抛错时读作「取不到」，不冒泡', async () => {
+test('credentialSourceFor：凭据服务抛错时读作「取不到」，不冒泡', async () => {
   const ctx = { get: () => ({ resolve: async () => { throw new Error('store offline') } }) }
-  assert.equal(await credentialResolverFor(ctx, 'DEEPSEEK_API_KEY')(), undefined)
+  assert.equal(await credentialSourceFor(ctx, 'DEEPSEEK_API_KEY').resolve(), undefined)
 })
 
-test('DeepSeek 引擎：凭据服务已挂载时视为可用，未挂载时不可用', () => {
-  const meta = ENGINE_METAS.find((entry) => entry.id === 'deepseek-official')
-  const mounted = new DeepSeekEngine({
-    meta,
-    credentialResolver: async () => 'from-store',
-    credentialSourcePresent: () => true,
-  })
-  assert.equal(mounted.available(), true, '凭据库里配了 key 的机器不应被误判为不可用')
+// ─── 凭据状态机：同步判定 + 热重载友好的负缓存 ────────────────────────────
 
-  // 挂了 resolver 但凭据服务根本不存在：必须如实报告不可用，
-  // 否则链里会多出一个必然失败的引擎。
-  const notMounted = new DeepSeekEngine({
+/**
+ * 让后台探针的整条微任务链（`then` → `catch` → `finally`）跑完。
+ *
+ * 用 setTimeout 而不是数「几次 await Promise.resolve()」：探针链的长度是
+ * 实现细节，数拍子会让测试在无关的实现改动下假性失败。
+ */
+const settle = () => new Promise((resolve) => { setTimeout(resolve, 0) })
+
+test('CredentialKeyState：只有确认有 key 才放行，绝不乐观返回 true', async () => {
+  const source = { resolve: async () => undefined, present: () => true }
+  const state = new CredentialKeyState(source)
+  // 首次询问时探针刚发出，还没结论 —— 必须如实返回 false，
+  // 否则没有 key 的引擎会白白发一次注定 401 的请求。
+  assert.equal(state.confirmed(), false)
+  await settle()
+  assert.equal(state.confirmed(), false, '探到「没有」之后仍应拒绝')
+})
+
+test('CredentialKeyState：探到 key 之后同步判定放行', async () => {
+  const source = { resolve: async () => 'sk-live', present: () => true }
+  const state = new CredentialKeyState(source)
+  assert.equal(state.confirmed(), false)
+  assert.equal(await state.resolve(), 'sk-live')
+  assert.equal(state.confirmed(), true, '解析过一次之后同步判定就应放行')
+})
+
+test('CredentialKeyState：负结论带 TTL，补上 key 后无需重启', async () => {
+  let at = 0
+  let stored
+  const source = { resolve: async () => stored, present: () => true }
+  const state = new CredentialKeyState(source, () => at, 5000)
+
+  state.confirmed()          // 触发探针
+  await settle()
+  assert.equal(state.confirmed(), false, 'TTL 内沿用负结论')
+
+  stored = 'sk-later'        // 用户往 .credentials.yaml 里补了 key
+  at += 4999
+  assert.equal(state.confirmed(), false, 'TTL 未到前不重探')
+  at += 2
+  state.confirmed()          // TTL 到期，重探
+  await settle()
+  assert.equal(state.confirmed(), true, '补上 key 后应被认到，无需重启')
+})
+
+test('CredentialKeyState：字面量优先，且不会去查凭据服务', async () => {
+  let calls = 0
+  const source = { resolve: async () => { calls += 1; return 'from-store' }, present: () => true }
+  const state = new CredentialKeyState(source)
+  assert.equal(await state.resolve('literal'), 'literal')
+  assert.equal(calls, 0, '有字面量时不应查凭据服务')
+  assert.equal(state.confirmed(), true)
+})
+
+test('CredentialKeyState：没有凭据来源时如实不可用', () => {
+  const state = new CredentialKeyState(undefined)
+  assert.equal(state.confirmed(), false)
+  assert.equal(state.sourcePresent(), false)
+})
+
+test('CredentialKeyState：凭据服务未挂载时不写负结论，挂载后仍能认到', async () => {
+  let mounted = false
+  let stored = 'sk-live'
+  const source = { resolve: async () => (mounted ? stored : undefined), present: () => mounted }
+  const state = new CredentialKeyState(source, () => 0, 5000)
+  assert.equal(state.confirmed(), false)
+
+  mounted = true
+  stored = 'sk-live'
+  assert.equal(state.confirmed(), false, '首次触发探针时还没有结论')
+  await settle()
+  assert.equal(state.confirmed(), true)
+})
+
+test('DeepSeek 引擎：凭据库里有 key 时可用，没有时如实不可用', async () => {
+  const meta = ENGINE_METAS.find((entry) => entry.id === 'deepseek-official')
+  const withKey = new DeepSeekEngine({
     meta,
-    credentialResolver: async () => undefined,
-    credentialSourcePresent: () => false,
+    credential: { resolve: async () => 'from-store', present: () => true },
   })
+  await withKey.search({ query: 'q' }).catch(() => {}) // 只为了让状态机解析一次
+  assert.equal(withKey.available(), true, '凭据库里配了 key 的机器不应被误判为不可用')
+
+  const notMounted = new DeepSeekEngine({ meta, credential: { resolve: async () => undefined, present: () => false } })
   assert.equal(notMounted.available(), false)
 
   const bare = new DeepSeekEngine({ meta })
@@ -360,8 +433,7 @@ test('DeepSeek 引擎：凭据库无 key 时给出可读的缺失错误', async 
   const meta = ENGINE_METAS.find((entry) => entry.id === 'deepseek-official')
   const engine = new DeepSeekEngine({
     meta,
-    credentialResolver: async () => undefined,
-    credentialSourcePresent: () => true,
+    credential: { resolve: async () => undefined, present: () => true },
   })
   await assert.rejects(
     engine.search({ query: 'q' }),

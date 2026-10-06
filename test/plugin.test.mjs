@@ -165,11 +165,16 @@ test('buildQuotaGuard：persist=false 时不落盘，仍保留预算判定', () 
   assert.equal(onDisk.check('tavily').allowed, true)
 })
 
-test('buildEngines：凭据库里的 DEEPSEEK_API_KEY 让内置兜底引擎在桌面端可用', () => {
+test('buildEngines：凭据库里的 DEEPSEEK_API_KEY 让内置兜底引擎在桌面端可用', async () => {
   const credentials = { resolve: async (ref) => (ref === 'DEEPSEEK_API_KEY' ? { value: 'sk-from-store' } : undefined) }
   const { ctx } = makeCtx({ credentials })
   const engines = buildEngines(ctx, {}, {})
   const deepseek = engines.find((engine) => engine.id === 'deepseek-official')
+
+  // available() 是同步的、凭据解析是异步的：构建时探针已发出，结论要等一个
+  // 微任务才落定。这里如实按这个时序断言，而不是假设它同步就知道答案。
+  const settles = () => new Promise((resolve) => { setTimeout(resolve, 0) })
+  await settles()
   assert.equal(
     deepseek.available(),
     true,

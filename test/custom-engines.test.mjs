@@ -407,3 +407,131 @@ test('护栏：自定义引擎的 dailyRequests 进入默认预算表', () => {
   assert.equal(verdict.allowed, false)
   assert.equal(verdict.limit, 1, '用户覆盖应压过表内推导值')
 })
+
+// ─── 密钥来自 harness 凭据 seam（$DSH_HOME/.credentials.yaml）─────────────
+//
+// 这是「参考 DSH 模型密钥方案」的落点：密钥不再只能来自配置或启动环境，
+// 而是和模型密钥放同一个文件、走同一套优先级，并且该文件被热监听。
+
+/** 只有凭据库里才有 key 的引擎。 */
+function storeBackedEngine(custom, id, stored) {
+  const { metas, problems } = customEngineMetas(custom)
+  assert.deepEqual(problems, [])
+  const meta = metas.find((entry) => entry.id === id)
+  return new JsonApiEngine({
+    meta,
+    credential: { resolve: async () => stored, present: () => true },
+  })
+}
+
+test('凭据 seam：key 只在凭据库里时，引擎仍被视为可用', async () => {
+  const engine = storeBackedEngine(
+    { mine: { endpoint: 'https://a.example/s', apiKeyEnv: 'MY_STORE_KEY', fields: { url: 'u' } } },
+    'mine',
+    'key-from-store',
+  )
+  // available() 是同步的，凭据解析是异步的 —— 首次询问只触发探针、不乐观放行。
+  assert.equal(engine.available(), false, '结论未出来之前不应乐观宣称可用')
+  // search() 会解析并刷新状态；用一次失败的搜索把它推起来。
+  await engine.search({ query: 'q' }).catch(() => {})
+  assert.equal(engine.available(), true, '确认凭据库里有 key 之后应可用')
+})
+
+test('凭据 seam：解析出的 key 真的被用于鉴权请求头', async () => {
+  const engine = storeBackedEngine(
+    { mine: { endpoint: 'https://a.example/s', apiKeyEnv: 'MY_STORE_KEY', fields: { url: 'u' } } },
+    'mine',
+    'key-from-store',
+  )
+  const stub = stubFetch(() => jsonResponse({ results: [] }))
+  try {
+    await engine.search({ query: 'q' })
+    assert.equal(stub.calls[0].init.headers.authorization, 'Bearer key-from-store')
+  } finally {
+    stub.restore()
+  }
+})
+
+test('凭据 seam：字面量密钥优先于凭据库，且不会去查凭据服务', async () => {
+  let calls = 0
+  const { metas } = customEngineMetas({
+    mine: { endpoint: 'https://a.example/s', apiKeyEnv: 'MY_STORE_KEY', fields: { url: 'u' } },
+  })
+  const engine = new JsonApiEngine({
+    meta: metas[0],
+    apiKey: 'literal-key',
+    credential: { resolve: async () => { calls += 1; return 'key-from-store' }, present: () => true },
+  })
+  const stub = stubFetch(() => jsonResponse({ results: [] }))
+  try {
+    await engine.search({ query: 'q' })
+    assert.equal(stub.calls[0].init.headers.authorization, 'Bearer literal-key')
+    assert.equal(calls, 0, '有字面量时不应查凭据服务')
+  } finally {
+    stub.restore()
+  }
+})
+
+test('凭据 seam：需要密钥却取不到时给出可读错误，而不是发一次裸请求', async () => {
+  const engine = storeBackedEngine(
+    { mine: { endpoint: 'https://a.example/s', apiKeyEnv: 'MY_STORE_KEY', fields: { url: 'u' } } },
+    'mine',
+    undefined,
+  )
+  const stub = stubFetch(() => jsonResponse({ results: [] }))
+  try {
+    await assert.rejects(
+      engine.search({ query: 'q' }),
+      (error) => error.code === 'WEB_PROVIDER_CREDENTIAL_MISSING'
+        && error.message.includes('MY_STORE_KEY')
+        && error.message.includes('.credentials.yaml'),
+    )
+    assert.equal(stub.calls.length, 0, '不应把注定 401 的请求发出去')
+  } finally {
+    stub.restore()
+  }
+})
+
+test('凭据 seam：免密钥引擎不受影响，也不会去查凭据库', async () => {
+  const { metas } = customEngineMetas({
+    free: { endpoint: 'https://a.example/s', auth: 'none', requiresKey: false, fields: { url: 'u' } },
+  })
+  const engine = new JsonApiEngine({ meta: metas[0] })
+  assert.equal(engine.available(), true)
+  const stub = stubFetch(() => jsonResponse({ results: [] }))
+  try {
+    await engine.search({ query: 'q' })
+    assert.equal(stub.calls[0].init.headers.authorization, undefined)
+  } finally {
+    stub.restore()
+  }
+})
+
+test('凭据 seam：buildEngineChain 会为每个需要密钥的引擎接上凭据来源', () => {
+  const seenRefs = []
+  const ctx = {
+    get(name) {
+      if (name !== 'credentials') return undefined
+      return {
+        resolve: async (ref) => { seenRefs.push(ref); return { value: `v:${ref}` } },
+      }
+    },
+  }
+  const { engines } = buildEngineChain(ctx, {
+    custom: { mine: { endpoint: 'https://a.example/s', apiKeyEnv: 'MY_STORE_KEY', fields: { url: 'u' } } },
+  })
+  // 内置的 tavily / langsearch / deepseek-official 与自定义引擎都应可用；
+  // bing 免密钥，不参与。
+  assert.equal(engines.find((engine) => engine.id === 'bing').available(), true)
+  for (const id of ['tavily', 'langsearch', 'deepseek-official', 'mine']) {
+    assert.equal(engines.find((engine) => engine.id === id).available(), false, `${id} 首询不乐观放行`)
+  }
+  // 触发一次搜索式解析，确认引用名解析正确（内置用默认变量名，自定义用 apiKeyEnv）。
+  return Promise.all([
+    engines.find((engine) => engine.id === 'tavily').search({ query: 'q' }),
+    engines.find((engine) => engine.id === 'mine').search({ query: 'q' }),
+  ]).catch(() => {}).then(() => {
+    assert.ok(seenRefs.includes('TAVILY_API_KEY'), `应查 TAVILY_API_KEY，实际 ${JSON.stringify(seenRefs)}`)
+    assert.ok(seenRefs.includes('MY_STORE_KEY'), `应查 MY_STORE_KEY，实际 ${JSON.stringify(seenRefs)}`)
+  })
+})
