@@ -101,13 +101,46 @@ export function stripTags(text: string): string {
   return text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
 }
 
-/** 解码搜索结果标题/摘要中常见的 HTML 实体。 */
+/**
+ * 搜索结果标题/摘要里高频出现的命名实体。
+ *
+ * 只列实际会遇到的：Bing 摘要几乎每条都带 `&ensp;`（日期与正文的分隔）和
+ * `&middot;`，中文结果还常见引号、破折号与省略号。
+ */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  nbsp: ' ', ensp: ' ', emsp: ' ', thinsp: ' ',
+  middot: '·', laquo: '«', raquo: '»', bull: '•',
+  mdash: '—', ndash: '–', hellip: '…',
+  lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”',
+  copy: '©', reg: '®', trade: '™', deg: '°',
+  times: '×', divide: '÷', plusmn: '±',
+  lt: '<', gt: '>', quot: '"', apos: "'",
+}
+
+/** 把数字实体安全地还原成一个字符；越界或非法一律保留原文。 */
+function codePointOf(digits: string, radix: number, fallback: string): string {
+  const value = Number.parseInt(digits, radix)
+  if (!Number.isFinite(value) || value < 0 || value > 0x10ffff) return fallback
+  try {
+    return String.fromCodePoint(value)
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 解码搜索结果标题/摘要中的 HTML 实体。
+ *
+ * 覆盖面是必要的而不只是「常见几个」：Bing 摘要里的分隔符是 `&ensp;`，
+ * 时间戳是 `&#0183;` 这类数字实体 —— 不解码就会原样喂给模型，
+ * 表现为引用里夹着 `&ensp;&#0183;&ensp;` 这种噪音。
+ *
+ * `&amp;` 放在最后处理，避免 `&amp;lt;` 被二次解码成 `<`（转义必须只解一层）。
+ */
 export function decodeEntities(text: string): string {
   return text
+    .replace(/&#x([0-9a-f]+);/gi, (match, hex: string) => codePointOf(hex, 16, match))
+    .replace(/&#(\d+);/g, (match, dec: string) => codePointOf(dec, 10, match))
+    .replace(/&([a-z][a-z0-9]*);/gi, (match, name: string) => NAMED_ENTITIES[name.toLowerCase()] ?? match)
     .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#0*39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
 }

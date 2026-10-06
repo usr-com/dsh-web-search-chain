@@ -4,6 +4,7 @@ import { ENGINE_METAS } from '../lib/engines.js'
 import { mapJsonApiPayload } from '../lib/json-api.js'
 import { citationSnippets, mapAnthropicResponse } from '../lib/llm.js'
 import { parseBingHtml, unwrapBingHref } from '../lib/bing.js'
+import { decodeEntities } from '../lib/util.js'
 
 const metaById = new Map(ENGINE_METAS.map((meta) => [meta.id, meta]))
 
@@ -105,6 +106,43 @@ test('Bing HTML 解析：提取标题、URL、摘要并解码实体', () => {
   assert.equal(sources[0].snippet, 'Snippet & text')
   assert.equal(sources[1].url, 'https://target.example/x')
   assert.equal(sources[1].title, 'Redirected')
+})
+
+// Bing 摘要里的分隔符是 &ensp;、时间戳是 &#0183; 这类数字实体；
+// 不解码就会原样进入引用文本（实测线上输出里确实带着 &ensp;&#0183;&ensp;）。
+test('decodeEntities：数字实体（十进制 / 十六进制）都要还原', () => {
+  assert.equal(decodeEntities('a&#0183;b'), 'a·b')
+  assert.equal(decodeEntities('a&#183;b'), 'a·b')
+  assert.equal(decodeEntities('a&#x27;b'), "a'b")
+  assert.equal(decodeEntities('a&#X2014;b'), 'a—b')
+})
+
+test('decodeEntities：命名实体覆盖摘要里真正会出现的那些', () => {
+  assert.equal(decodeEntities('1&ensp;&#0183;&ensp;text'), '1 · text')
+  assert.equal(decodeEntities('a&nbsp;b&mdash;c&hellip;d'), 'a b—c…d')
+  assert.equal(decodeEntities('&ldquo;引号&rdquo;'), '“引号”')
+  assert.equal(decodeEntities('A&middot;B&Trade;C'), 'A·B™C')
+})
+
+test('decodeEntities：转义只解一层，未知实体原样保留', () => {
+  assert.equal(decodeEntities('&amp;lt;'), '&lt;', '&amp;lt; 不能变成 <')
+  assert.equal(decodeEntities('&amp;amp;'), '&amp;')
+  assert.equal(decodeEntities('5 &lt; 6 &amp;&amp; 7 &gt; 6'), '5 < 6 && 7 > 6')
+  assert.equal(decodeEntities('&unknownentity;'), '&unknownentity;')
+  assert.equal(decodeEntities('&#xZZ;'), '&#xZZ;', '非法十六进制保留原文')
+  assert.equal(decodeEntities('&#99999999999;'), '&#99999999999;', '越界码点保留原文')
+})
+
+test('parseBingHtml：真实形状的摘要被清干净', () => {
+  const html = `
+    <li class="b_algo">
+      <h2><a href="https://example.com/x">标题 &amp; 副标题</a></h2>
+      <div class="b_caption"><p>2026年10月6日&ensp;&#0183;&ensp;正文 &mdash; 更多</p></div>
+    </li>`
+  const [source] = parseBingHtml(html)
+  assert.equal(source.title, '标题 & 副标题')
+  assert.equal(source.snippet, '2026年10月6日 · 正文 — 更多')
+  assert.ok(!source.snippet.includes('&'), '摘要里不该残留任何实体')
 })
 
 test('unwrapBingHref：直链保留、ck 链接解包、无效链接拒绝', () => {
