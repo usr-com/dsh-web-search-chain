@@ -132,23 +132,43 @@ export class JsonApiEngine implements Engine {
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const body: Record<string, unknown> = { query: request.query }
-    const { countField, extra } = this.options.meta.request
+    const meta = this.options.meta
+    const { queryField, countField, extra, extraQuery } = meta.request
+    const method = meta.method
+
+    // GET 的查询全部走查询串；POST 的查询词在请求体里，但 `extraQuery` 与
+    // `auth: 'query'` 两种模式仍要拼到 URL 上（很多接口混用两者）。
+    let endpoint = this.endpoint
+    if (method === 'GET' || extraQuery !== undefined || meta.auth === 'query') {
+      const url = new URL(this.endpoint)
+      if (method === 'GET') {
+        url.searchParams.set(queryField ?? 'query', request.query)
+        if (countField !== undefined && request.maxResults !== undefined) {
+          url.searchParams.set(countField, String(request.maxResults))
+        }
+      }
+      if (extraQuery !== undefined) {
+        for (const [key, value] of Object.entries(extraQuery)) url.searchParams.set(key, value)
+      }
+      if (meta.auth === 'query' && (this.apiKey?.length ?? 0) > 0) {
+        url.searchParams.set(meta.authParam as string, this.apiKey as string)
+      }
+      endpoint = url.toString()
+    }
+
+    const body: Record<string, unknown> = { [queryField ?? 'query']: request.query }
     if (countField !== undefined && request.maxResults !== undefined) {
       body[countField] = request.maxResults
     }
     if (extra !== undefined) Object.assign(body, extra)
 
-    const endpoint = this.endpoint
     let response: Response
     try {
       response = await fetch(endpoint, {
-        method: this.options.meta.method,
+        method,
         redirect: 'error',
         headers: this.buildHeaders(),
-        ...this.options.meta.method === 'POST'
-          ? { body: JSON.stringify(body) }
-          : {},
+        ...method === 'POST' ? { body: JSON.stringify(body) } : {},
         ...signal !== undefined ? { signal } : {},
       })
     } catch (error: unknown) {
@@ -199,16 +219,19 @@ export class JsonApiEngine implements Engine {
 
   private buildHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
-      'content-type': 'application/json',
       'accept': 'application/json',
       'user-agent': PLUGIN_USER_AGENT,
     }
+    if (this.options.meta.method === 'POST') headers['content-type'] = 'application/json'
     const auth = this.options.meta.auth
-    if (auth !== 'none' && (this.apiKey?.length ?? 0) > 0) {
+    const key = this.apiKey
+    if (auth !== 'none' && auth !== 'query' && (key?.length ?? 0) > 0) {
       if (auth === 'x-api-key') {
-        headers['x-api-key'] = this.apiKey as string
+        headers['x-api-key'] = key as string
+      } else if (auth === 'header') {
+        headers[this.options.meta.authHeader as string] = key as string
       } else {
-        headers['authorization'] = `Bearer ${this.apiKey as string}`
+        headers['authorization'] = `Bearer ${key as string}`
       }
     }
     return headers

@@ -97,6 +97,63 @@ test('defaultQuotaStatePath：跟随启动环境里的 DSH_HOME', () => {
   assert.equal(defaultQuotaStatePath(ctx), join('D:\\custom-dsh-home', 'web-search-chain-quota.json'))
 })
 
+// ─── customEngines：从配置到注册 ──────────────────────────────────────────
+
+test('配置 schema：接受并归一化 customEngines', () => {
+  const parsed = Config({
+    customEngines: {
+      brave: {
+        kind: 'json-api',
+        endpoint: 'https://api.search.brave.com/res/v1/web/search',
+        method: 'GET',
+        auth: 'header',
+        authHeader: 'X-Subscription-Token',
+        queryField: 'q',
+        countField: 'count',
+        resultsPath: 'web.results',
+        fields: { title: 'title', url: 'url', snippet: 'description' },
+        dailyRequests: 50,
+      },
+    },
+  })
+  const brave = parsed.customEngines.brave
+  assert.equal(brave.kind, 'json-api')
+  assert.equal(brave.method, 'GET')
+  assert.equal(brave.auth, 'header')
+  assert.equal(brave.authHeader, 'X-Subscription-Token')
+  assert.equal(brave.resultsPath, 'web.results')
+  assert.equal(brave.dailyRequests, 50)
+  assert.equal(brave.queryField, 'q')
+})
+
+test('apply：自定义引擎进入链，并出现在注册日志里', () => {
+  const { ctx, registered, logs } = makeCtx()
+  apply(ctx, {
+    customEngines: {
+      mine: { endpoint: 'https://a.example/s', apiKey: 'k', fields: { url: 'u' } },
+    },
+  })
+  assert.equal(registered.length, 1)
+  const line = logs.find((entry) => entry.includes('已注册'))
+  assert.ok(line, `应有注册日志：${JSON.stringify(logs)}`)
+  assert.match(line, /mine/, '自定义引擎应出现在引擎顺序里')
+})
+
+test('apply：非法的自定义引擎被跳过并告警，但注册照样成功', () => {
+  const { ctx, registered, logs } = makeCtx()
+  apply(ctx, {
+    customEngines: {
+      broken: { endpoint: '' },
+      fine: { endpoint: 'https://a.example/s', fields: { url: 'u' } },
+    },
+  })
+  assert.equal(registered.length, 1, '一个坏条目不应让插件注册失败')
+  assert.equal(registered[0].available(), true, 'Bing 兜底仍在')
+  const warning = logs.find((entry) => entry.includes('broken'))
+  assert.ok(warning, `应有针对 broken 的告警：${JSON.stringify(logs)}`)
+  assert.match(warning, /跳过/)
+})
+
 test('buildQuotaGuard：persist=false 时不落盘，仍保留预算判定', () => {
   const { ctx } = makeCtx({ env: { DSH_HOME: 'D:\\custom-dsh-home' } })
   const inMemory = buildQuotaGuard(ctx, { enabled: true, dailyLimits: { tavily: 1 }, persist: false })

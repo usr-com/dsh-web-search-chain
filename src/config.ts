@@ -1,6 +1,7 @@
 /**
- * 插件配置：链接策略、超时、默认结果上限，以及按引擎 id 的部分覆盖。
- * 新增引擎时无需修改这里的 schema —— 只有 `engines.<id>.*` 覆盖字段才是用户可写的面。
+ * 插件配置：链接策略、超时、默认结果上限、按引擎 id 的部分覆盖，
+ * 以及**用户自带的搜索引擎定义**（`customEngines` —— 只要对方提供 API key
+ * 和一套标准查询接口，就能加进链里，无需改代码）。
  * @module dsh-web-search-chain/config
  */
 
@@ -23,6 +24,73 @@ export interface EngineConfig {
   baseURL?: string
 }
 
+/** 鉴权写法。 */
+export type CustomEngineAuth = 'bearer' | 'x-api-key' | 'header' | 'query' | 'none'
+
+/** 自定义引擎的结果字段映射；值都是响应 JSON 里的点分路径。 */
+export interface CustomEngineFields {
+  /** 标题字段路径。 */
+  title?: string
+  /** URL 字段路径（**必填**：seam 的 source 必须有 URL）。 */
+  url?: string
+  /** 摘要字段路径。 */
+  snippet?: string
+  /** 摘要为空时的回退字段路径。 */
+  snippetFallback?: string
+  /** 发布时间字段路径。 */
+  publishedAt?: string
+}
+
+/**
+ * 用户自定义引擎。
+ *
+ * 两种协议种类，都只需声明、不需要写代码：
+ * - `json-api`：标准 JSON 搜索接口（POST 请求体，或 GET 查询串）；
+ * - `scrape`：免密钥 HTML 抓取，端点模板支持 `{query}` 与 `{count}`。
+ *
+ * 继承 {@link EngineConfig}，因此 `engines.<自定义 id>` 也能覆盖它的
+ * `enabled` / `priority` / `apiKey` / `apiKeyEnv` / `baseURL`。
+ */
+export interface CustomEngineConfig extends EngineConfig {
+  /** 协议种类，默认 `'json-api'`。 */
+  kind?: 'json-api' | 'scrape'
+  /** 人类可读名；缺省用 id。 */
+  name?: string
+  /** 供应商描述；缺省用端点主机名。 */
+  vendor?: string
+  /**
+   * `json-api`：完整端点 URL。
+   * `scrape`：端点模板，须含 `{query}`。
+   */
+  endpoint: string
+  /** HTTP 方法，默认 `'POST'`；`scrape` 恒为 GET。 */
+  method?: 'GET' | 'POST'
+  /** 鉴权写法；缺省时按「有没有 key」推断（有 key → bearer，无 key → none）。 */
+  auth?: CustomEngineAuth
+  /** `auth: 'header'` 时的请求头名。 */
+  authHeader?: string
+  /** `auth: 'query'` 时的查询参数名（密钥拼进 URL）。 */
+  authParam?: string
+  /** 是否需要密钥；缺省由 `auth` 推断。 */
+  requiresKey?: boolean
+  /** 查询词字段名，默认 `'query'`。 */
+  queryField?: string
+  /** 透传 `maxResults` 的字段名（Tavily 用 `max_results`，LangSearch 用 `count`）。 */
+  countField?: string
+  /** 固定附加的查询参数（`json-api` 的 GET 与 `scrape` 都会带上）。 */
+  extraQuery?: Record<string, string>
+  /** 固定附加的请求体字段（仅 `json-api` 的 POST）。 */
+  extraBody?: Record<string, unknown>
+  /** 结果数组的 JSON 路径，默认 `'results'`。 */
+  resultsPath?: string
+  /** 字段映射。 */
+  fields?: CustomEngineFields
+  /** 该引擎的每日请求上限；缺省用 `DEFAULT_DAILY_LIMIT`。`0` = 不限制。 */
+  dailyRequests?: number
+  /** 免费额度依据说明（出现在护栏的日志与错误里）。 */
+  note?: string
+}
+
 /** 插件生效配置。 */
 export interface Config {
   /** 链接策略，默认 'failover'。 */
@@ -32,14 +100,20 @@ export interface Config {
   /** 请求未携带 maxResults 时的默认结果上限，默认 8。 */
   maxResults?: number
   /**
-   * 顶层集中密钥区：键为引擎 id（tavily / langsearch / deepseek-official），
+   * 顶层集中密钥区：键为引擎 id（tavily / langsearch / deepseek-official / 自定义 id），
    * 值为该引擎的 API 密钥。这是「配置密钥即用」的推荐入口 —— Web UI 会以
    * 密码框渲染（role: secret）。优先级低于 `engines.<id>.apiKey`，
-   * 高于环境变量。缺省为 undefined（全部回落到环境变量）。
+   * 高于环境变量。缺省为 undefined（全部回落到环境变量与凭据库）。
    */
   apiKeys?: Record<string, string>
-  /** 按引擎 id 覆盖（id 见 {@link ../engines!ENGINE_METAS}）。 */
+  /** 按引擎 id 覆盖（内置 id 见 {@link ../engines!ENGINE_METAS}，自定义 id 见 `customEngines`）。 */
   engines?: Record<string, EngineConfig>
+  /**
+   * 自定义引擎：键为引擎 id，值为完整定义。内置 id 不可占用（要改内置引擎请用 `engines`）。
+   * 定义不合法的条目会被**跳过并告警**，不影响其余引擎 —— 一个写错的条目不应该让
+   * 整条链连 Bing 兜底都没有。
+   */
+  customEngines?: Record<string, CustomEngineConfig>
   /** 请求预算护栏：见 {@link QuotaConfig}。缺省启用内置默认值。 */
   quota?: QuotaConfig
 }
@@ -96,4 +170,37 @@ export const Config: Schema<Config> = Schema.object({
     apiKeyEnv: Schema.string(),
     baseURL: Schema.string(),
   })),
+  customEngines: Schema.dict(Schema.object({
+    kind: Schema.union(['json-api', 'scrape']).default('json-api'),
+    name: Schema.string(),
+    vendor: Schema.string(),
+    enabled: Schema.boolean(),
+    priority: Schema.number().min(-1000).max(1000).step(1),
+    endpoint: Schema.string(),
+    method: Schema.union(['GET', 'POST']).default('POST'),
+    auth: Schema.union(['bearer', 'x-api-key', 'header', 'query', 'none']),
+    authHeader: Schema.string(),
+    authParam: Schema.string(),
+    requiresKey: Schema.boolean(),
+    queryField: Schema.string(),
+    countField: Schema.string(),
+    extraQuery: Schema.dict(Schema.string()),
+    extraBody: Schema.dict(Schema.any()),
+    resultsPath: Schema.string(),
+    fields: Schema.object({
+      title: Schema.string(),
+      url: Schema.string(),
+      snippet: Schema.string(),
+      snippetFallback: Schema.string(),
+      publishedAt: Schema.string(),
+    }),
+    dailyRequests: Schema.number().min(0).step(1),
+    note: Schema.string(),
+    apiKey: Schema.string().role('secret'),
+    apiKeyEnv: Schema.string(),
+    baseURL: Schema.string(),
+  })).description(
+    '自定义搜索引擎：键为引擎 id，值为完整定义。只要对方提供 API key 和标准查询接口，'
+    + '就能加进链里参与降级，无需改插件代码。内置 id 不可占用；定义不合法的条目会被跳过并告警。',
+  ),
 })

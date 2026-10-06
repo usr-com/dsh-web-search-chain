@@ -14,18 +14,32 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import type { EngineConfig } from './config.js'
+import type { CustomEngineAuth, CustomEngineConfig, EngineConfig } from './config.js'
 import type { Engine } from './engine.js'
 import { BingEngine } from './bing.js'
 import { DeepSeekEngine } from './llm.js'
 import { JsonApiEngine } from './json-api.js'
+import { DEFAULT_DAILY_LIMIT } from './quota.js'
+
+/**
+ * 自定义引擎的默认优先级。
+ *
+ * 内置是 tavily 10 / langsearch 20 / bing 30 / deepseek-official 40。
+ * 25 让用户新加的 API 引擎排在 Bing 之前 —— 对方给了 key 的正式接口，
+ * 可信度高于免密钥抓取，但不该抢在已配好的 Tavily / LangSearch 前面。
+ */
+export const CUSTOM_ENGINE_DEFAULT_PRIORITY = 25
 
 /** JSON API 引擎：请求构造的声明片段。 */
 export interface JsonApiRequestSpec {
+  /** 查询词字段名，默认 `'query'`。 */
+  queryField?: string
   /** 透传 `maxResults` 的字段名（Tavily 用 `max_results`，LangSearch 用 `count`）。 */
   countField?: string
-  /** 每次请求都会携带的固定附加字段。 */
+  /** 每次请求都会携带的固定附加字段（POST 请求体）。 */
   extra?: Record<string, unknown>
+  /** 每次请求都会携带的固定查询参数（GET 查询串；POST 也会拼在 URL 上）。 */
+  extraQuery?: Record<string, string>
 }
 
 /** JSON API 引擎：响应映射的声明片段。 */
@@ -71,8 +85,12 @@ export interface JsonApiEngineMeta {
   readonly requiresKey: boolean
   /** 密钥来源的默认环境变量名。 */
   readonly authEnv?: string
-  /** 认证头写法；`none` 表示无需认证。 */
-  readonly auth: 'bearer' | 'x-api-key' | 'none'
+  /** 认证头写法；`none` 表示无需认证（`query` 表示密钥拼进 URL 查询串）。 */
+  readonly auth: CustomEngineAuth
+  /** `auth: 'header'` 时的请求头名。 */
+  readonly authHeader?: string
+  /** `auth: 'query'` 时的查询参数名。 */
+  readonly authParam?: string
   /** 完整端点（含路径）。 */
   readonly endpoint: string
   readonly method: 'POST' | 'GET'
@@ -349,45 +367,233 @@ export function credentialSourcePresentFor(ctx: Context): () => boolean {
 export function sortEngines(
   engines: readonly Engine[],
   overrides: Record<string, EngineConfig>,
+  metas: readonly EngineMeta[] = ENGINE_METAS,
 ): Engine[] {
   const priorityOf = (engine: Engine): number => {
-    const meta = ENGINE_METAS.find((entry) => entry.id === engine.id)
+    const meta = metas.find((entry) => entry.id === engine.id)
     return overrides[engine.id]?.priority ?? meta?.defaultPriority ?? 0
   }
   return [...engines].sort((a, b) => priorityOf(a) - priorityOf(b))
 }
 
 /**
- * 从静态表推导「引擎 id → 每日请求上限」的默认预算。
+ * 从静态表 + 自定义定义推导「引擎 id → 每日请求上限」的默认预算。
  *
  * 只包含声明了 `dailyRequests > 0` 的引擎；`0` 表示不限制（故不进入预算表）。
  */
-export function defaultDailyLimits(): Record<string, number> {
+export function defaultDailyLimits(metas: readonly EngineMeta[] = ENGINE_METAS): Record<string, number> {
   const limits: Record<string, number> = {}
-  for (const meta of ENGINE_METAS) {
+  for (const meta of metas) {
     if (meta.freeTier.dailyRequests > 0) limits[meta.id] = meta.freeTier.dailyRequests
   }
   return limits
 }
 
+// ─── 自定义引擎：把用户配置编译成引擎元数据行 ───────────────────────────────
+
+/** 一条被跳过的自定义引擎定义，以及原因。 */
+export interface EngineChainProblem {
+  /** 出问题的引擎 id（id 本身非法时为原始键）。 */
+  readonly id: string
+  /** 面向人的一句话，带修复建议。 */
+  readonly message: string
+}
+
+/** 自定义引擎编译结果。 */
+export interface CustomEngineCompileResult {
+  /** 通过校验、可直接进链的元数据行。 */
+  readonly metas: EngineMeta[]
+  /** 被跳过的条目及原因；由调用方告警。 */
+  readonly problems: EngineChainProblem[]
+}
+
+/** 合法的自定义引擎 id：与配置键、`engines` 覆盖键一致，且能安全出现在日志里。 */
+const CUSTOM_ENGINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
+/** 端点必须是绝对 http(s) URL（`scrape` 模板另需 `{query}` 占位符）。 */
+function isAbsoluteHttpUrl(value: string): boolean {
+  if (!URL.canParse(value)) return false
+  const protocol = new URL(value).protocol
+  return protocol === 'http:' || protocol === 'https:'
+}
+
+/** 从 URL 里取主机名，作为 vendor 兜底。 */
+function hostOf(endpoint: string): string {
+  try {
+    return new URL(endpoint.replace('{query}', 'q').replace('{count}', '1')).host
+  } catch {
+    return endpoint
+  }
+}
+
 /**
- * 把静态引擎表 + 用户覆盖合成为排序后的引擎链。
- * 未显式 `enabled: false` 的引擎都会进入链；需要密钥却缺 key 的引擎会在
- * available()（本地检查）阶段出局，链内其余引擎照常工作 —— 这正是「带 API 与
- * 不带 API 的后端统一在一条链上」的落点。
+ * 把 `config.customEngines` 编译成引擎元数据行。
  *
- * @param ctx - 插件上下文，用于读取启动环境与凭据服务中的密钥。
- * @param overrides - 用户按引擎 id 提供的覆盖（缺省 {}）。
- * @param apiKeys - 顶层集中密钥区（缺省 {}），键为引擎 id。
- * @returns 已按优先级升序排序的引擎实例。
+ * 校验失败**不抛异常**，而是把该条目记进 `problems` 并跳过：一个写错的
+ * 自定义引擎不应该让整条链连免密钥 Bing 兜底都起不来。调用方负责把这些
+ * 问题写进日志，让用户看得见。
+ *
+ * @param custom - 用户配置，键为引擎 id。
+ * @returns 可进链的元数据行与被跳过的条目。
  */
-export function buildEngines(
-  ctx: Context,
-  overrides: Record<string, EngineConfig> = {},
-  apiKeys: Record<string, string> = {},
-): Engine[] {
+export function customEngineMetas(custom: Record<string, CustomEngineConfig> = {}): CustomEngineCompileResult {
+  const metas: EngineMeta[] = []
+  const problems: EngineChainProblem[] = []
+  const builtinIds = new Set(ENGINE_METAS.map((meta) => meta.id))
+
+  for (const [id, raw] of Object.entries(custom)) {
+    const fail = (message: string): void => {
+      problems.push({ id, message })
+    }
+    const cfg = raw ?? ({} as CustomEngineConfig)
+
+    if (!CUSTOM_ENGINE_ID.test(id)) {
+      fail('引擎 id 只能由字母、数字、点、下划线和连字符组成，且以字母或数字开头')
+      continue
+    }
+    if (builtinIds.has(id)) {
+      fail(`与内置引擎 id 冲突；要调整内置引擎请用 config.engines.${id}，要新增请换个 id`)
+      continue
+    }
+
+    const kind = cfg.kind ?? 'json-api'
+    const endpoint = cfg.endpoint?.trim() ?? ''
+    if (endpoint.length === 0) {
+      fail('缺少 endpoint')
+      continue
+    }
+    if (!isAbsoluteHttpUrl(endpoint)) {
+      fail(`endpoint 必须是绝对 http(s) URL，实际是 ${JSON.stringify(endpoint)}`)
+      continue
+    }
+
+    const auth = cfg.auth ?? (resolvedKey(cfg.apiKey?.trim()) !== undefined || cfg.apiKeyEnv !== undefined ? 'bearer' : 'none')
+    if (auth === 'header' && (cfg.authHeader?.trim() ?? '').length === 0) {
+      fail("auth: 'header' 时必须给出 authHeader（请求头名）")
+      continue
+    }
+    if (auth === 'query' && (cfg.authParam?.trim() ?? '').length === 0) {
+      fail("auth: 'query' 时必须给出 authParam（查询参数名）")
+      continue
+    }
+
+    // requiresKey：显式声明优先；否则 'none' 之外都需要 key。
+    const requiresKey = cfg.requiresKey ?? (auth !== 'none')
+    const freeTier: EngineFreeTier = {
+      dailyRequests: cfg.dailyRequests ?? DEFAULT_DAILY_LIMIT,
+      note: cfg.note?.trim() ?? `自定义引擎：未声明免费额度，取保守默认值 ${DEFAULT_DAILY_LIMIT} 次/日。`,
+    }
+    const name = cfg.name?.trim() ?? id
+    const vendor = cfg.vendor?.trim() ?? hostOf(endpoint)
+    const priority = cfg.priority ?? CUSTOM_ENGINE_DEFAULT_PRIORITY
+
+    if (kind === 'scrape') {
+      if (!endpoint.includes('{query}')) {
+        fail("kind: 'scrape' 的 endpoint 模板必须包含 {query} 占位符")
+        continue
+      }
+      metas.push({
+        kind: 'scrape',
+        id,
+        name,
+        vendor,
+        requiresKey: false,
+        endpoint,
+        defaultPriority: priority,
+        freeTier,
+        ...cfg.extraQuery !== undefined ? { extraQuery: cfg.extraQuery } : {},
+      })
+      continue
+    }
+
+    const resultsPath = cfg.resultsPath?.trim() ?? 'results'
+    const urlField = cfg.fields?.url?.trim() ?? ''
+    if (urlField.length === 0) {
+      fail('缺少 fields.url：seam 的每条 source 都必须有 URL，没有它这条定义无法产出可引用结果')
+      continue
+    }
+
+    metas.push({
+      kind: 'json-api',
+      id,
+      name,
+      vendor,
+      requiresKey,
+      auth,
+      ...auth === 'header' ? { authHeader: cfg.authHeader?.trim() as string } : {},
+      ...auth === 'query' ? { authParam: cfg.authParam?.trim() as string } : {},
+      // 密钥环境变量名只有用户显式给出时才存在；凭据库里也用这个名字查。
+      ...cfg.apiKeyEnv?.trim() !== undefined && cfg.apiKeyEnv.trim().length > 0
+        ? { authEnv: cfg.apiKeyEnv.trim() }
+        : {},
+      endpoint,
+      method: cfg.method ?? 'POST',
+      defaultPriority: priority,
+      freeTier,
+      request: {
+        queryField: cfg.queryField?.trim() ?? 'query',
+        ...cfg.countField?.trim() !== undefined && cfg.countField.trim().length > 0
+          ? { countField: cfg.countField.trim() }
+          : {},
+        ...cfg.extraBody !== undefined ? { extra: cfg.extraBody } : {},
+        ...cfg.extraQuery !== undefined ? { extraQuery: cfg.extraQuery } : {},
+      },
+      response: {
+        resultsPath,
+        fields: {
+          title: cfg.fields?.title?.trim() ?? 'title',
+          url: urlField,
+          ...cfg.fields?.snippet?.trim() !== undefined && cfg.fields.snippet.trim().length > 0
+            ? { snippet: cfg.fields.snippet.trim() }
+            : {},
+          ...cfg.fields?.snippetFallback?.trim() !== undefined && cfg.fields.snippetFallback.trim().length > 0
+            ? { snippetFallback: cfg.fields.snippetFallback.trim() }
+            : {},
+          ...cfg.fields?.publishedAt?.trim() !== undefined && cfg.fields.publishedAt.trim().length > 0
+            ? { publishedAt: cfg.fields.publishedAt.trim() }
+            : {},
+        },
+      },
+    })
+  }
+
+  return { metas, problems }
+}
+
+/** 构造完整引擎链的输入。 */
+export interface BuildChainInput {
+  /** 按引擎 id 的部分覆盖。 */
+  readonly overrides?: Record<string, EngineConfig>
+  /** 顶层集中密钥区。 */
+  readonly apiKeys?: Record<string, string>
+  /** 用户自定义引擎定义。 */
+  readonly custom?: Record<string, CustomEngineConfig>
+}
+
+/** 完整引擎链的构造结果。 */
+export interface BuildChainResult {
+  /** 已按优先级升序排序的引擎实例（内置 + 自定义）。 */
+  readonly engines: Engine[]
+  /** 被跳过的自定义条目（调用方应告警）。 */
+  readonly problems: readonly EngineChainProblem[]
+  /** 实际参与装配的全部元数据行（护栏推导默认预算时要与它一致）。 */
+  readonly metas: readonly EngineMeta[]
+}
+
+/**
+ * 把内置静态表 + 自定义引擎定义 + 用户覆盖合成为引擎链。
+ *
+ * 两类引擎走同一条装配路径：自定义引擎只是「用户在自己的配置里多写了几行
+ * 元数据」，因此密钥解析、优先级排序、护栏预算、适配器选择全部与内置一致。
+ */
+export function buildEngineChain(ctx: Context, input: BuildChainInput = {}): BuildChainResult {
+  const overrides = input.overrides ?? {}
+  const apiKeys = input.apiKeys ?? {}
+  const compiled = customEngineMetas(input.custom)
+  const metas: EngineMeta[] = [...ENGINE_METAS, ...compiled.metas]
+
   const engines: Engine[] = []
-  for (const meta of ENGINE_METAS) {
+  for (const meta of metas) {
     const cfg = overrides[meta.id] ?? {}
     if (cfg.enabled === false) continue
     const literalKey = resolvedKey(cfg.apiKey?.trim())
@@ -404,5 +610,27 @@ export function buildEngines(
       credentialSourcePresent: wantsCredentialService ? credentialSourcePresentFor(ctx) : undefined,
     }))
   }
-  return sortEngines(engines, overrides)
+
+  return { engines: sortEngines(engines, overrides, metas), problems: compiled.problems, metas }
+}
+
+/**
+ * 把静态引擎表 + 用户覆盖合成为排序后的引擎链（{@link buildEngineChain} 的便捷形式）。
+ * 未显式 `enabled: false` 的引擎都会进入链；需要密钥却缺 key 的引擎会在
+ * available()（本地检查）阶段出局，链内其余引擎照常工作 —— 这正是「带 API 与
+ * 不带 API 的后端统一在一条链上」的落点。
+ *
+ * @param ctx - 插件上下文，用于读取启动环境与凭据服务中的密钥。
+ * @param overrides - 用户按引擎 id 提供的覆盖（缺省 {}）。
+ * @param apiKeys - 顶层集中密钥区（缺省 {}），键为引擎 id。
+ * @param custom - 用户自定义引擎定义（缺省 {}）。定义不合法者被跳过。
+ * @returns 已按优先级升序排序的引擎实例。
+ */
+export function buildEngines(
+  ctx: Context,
+  overrides: Record<string, EngineConfig> = {},
+  apiKeys: Record<string, string> = {},
+  custom: Record<string, CustomEngineConfig> = {},
+): Engine[] {
+  return buildEngineChain(ctx, { overrides, apiKeys, custom }).engines
 }
