@@ -1,11 +1,15 @@
-# 统一换行符为 LF：这个包会发布到 npm 并在 Linux/macOS 上被安装，
-# 仓库里存 CRLF 会污染 diff，也可能影响依赖它的工具。
+# Normalize line endings to LF: this package is published to npm and installed
+# on Linux/macOS, and CRLF in the repository pollutes diffs.
+#
+# Every text file is covered, lockfiles included — `text=auto` also normalizes
+# the working tree before comparison, so a tool that rewrites a file with CRLF
+# does not show up as a spurious modification.
 * text=auto eol=lf
 
-# 二进制文件不做换行转换
+# Binary files are never converted.
 *.png binary
 *.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
 *.tgz binary
-
-# lockfile 保持原样，避免无意义的行尾变更
-pnpm-lock.yaml -text
