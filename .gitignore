@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 密钥与本地环境（.env.example 模板保留提交）
+.env
+.env.*
+!.env.example
+
+# 构建产物（由 pnpm build 生成，配合 npm 包发布时在 prepare 阶段重新构建）
+lib/
+
+# 日志
+*.log

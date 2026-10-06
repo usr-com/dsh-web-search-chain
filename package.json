@@ -1,0 +1,61 @@
+{
+  "name": "dsh-web-search-chain",
+  "version": "0.1.0",
+  "description": "通用版 Web 搜索 provider 插件：把带 API 与免密钥后端统一到一条可扩展的提供者链上（内置 Tavily / LangSearch / Bing 免密钥抓取 / DeepSeek 官方后端），注册为 @deepseek-ai/dsh-web 的 WebSearchProvider",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./engines": {
+      "types": "./lib/engines.d.ts",
+      "default": "./lib/engines.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "keywords": [
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "web-search",
+    "tavily",
+    "langsearch",
+    "bing",
+    "provider"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-launch-environment": "*",
+    "@deepseek-ai/dsh-web": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "volta": {
+    "node": "24.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-launch-environment": "*",
+    "@deepseek-ai/dsh-web": "*",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2"
+  }
+}

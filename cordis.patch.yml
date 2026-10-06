@@ -1,0 +1,39 @@
+# dsh-web-search-chain 的 bundle 层 patch。
+#
+# 本文件随包发布，由 `dsh plugin add` 应用（插件行用包名 dsh-web-search-chain 引用）。
+# 本地自测直接用 --patch 时，请改用 examples/local.patch.yml（路径引用本仓库入口）。
+#
+# ⚠️ 本文件只负责「插入本链」。**它不能让你接管搜索** —— dsh-base 的 bundle patch
+#    已经显式写了 `searchProvider: deepseek-official`，而 dsh-web 的选择规则是
+#    「配置了 id 就用配置的 id」，不会因为多注册了一个 provider 就自动改选
+#    （也不会报 WEB_PROVIDER_AMBIGUOUS）。所以安装之后还必须覆盖 `web` 行：
+#
+#       - id: web
+#         name: '@deepseek-ai/dsh-web'
+#         config:
+#           searchProvider: web-search-chain
+#           fetchProvider: http
+#
+#    注意 patch 语义是**替换整行 config**，`fetchProvider` 必须重述。
+#    另一种方式是在启动环境里设 `DSH_WEB_SEARCH_PROVIDER=web-search-chain`。
+#
+# 密钥按「engines.<id>.apiKey → apiKeys.<id> → 环境变量 → harness 凭据库」顺序解析；
+# 缺 key 的引擎自动不可用，链会降级到免密钥 Bing，无需任何配置。
+#
+# `quota` 是请求预算护栏（默认启用）：按引擎限制每日请求次数，并在提供方返回
+# 429/432/433 后让该引擎进入冷却期，避免免费额度被静默耗尽后产生费用。
+# 默认上限由各引擎的免费额度推导，见 README。
+- insert:
+    - id: web-search-chain
+      name: dsh-web-search-chain
+      config:
+        strategy: failover
+        timeoutMs: 15000
+        maxResults: 8
+        apiKeys: {}
+        engines: {}
+        quota:
+          enabled: true
+          dailyLimits: {}
+          cooldownMs: 600000
+          persist: true
